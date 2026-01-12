@@ -332,6 +332,19 @@ KnownFPClass KnownFPClass::fmul(const KnownFPClass &KnownLHS,
   return Known;
 }
 
+KnownFPClass KnownFPClass::fma(const KnownFPClass &KnownLHS,
+                               const KnownFPClass &KnownRHS,
+                               const KnownFPClass &KnownAddend,
+                               DenormalMode Mode) {
+  return fadd(fmul(KnownLHS, KnownRHS, Mode), KnownAddend, Mode);
+}
+
+KnownFPClass KnownFPClass::fma_square(const KnownFPClass &KnownSquared,
+                                      const KnownFPClass &KnownAddend,
+                                      DenormalMode Mode) {
+  return fadd(square(KnownSquared, Mode), KnownAddend, Mode);
+}
+
 KnownFPClass KnownFPClass::exp(const KnownFPClass &KnownSrc) {
   KnownFPClass Known;
   Known.knownNot(fcNegative);
