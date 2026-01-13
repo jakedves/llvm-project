@@ -2054,9 +2054,10 @@ bool PreRARematStage::setObjective() {
     if (!Target.satisfied())
       TargetRegions.set(I);
 
-    // We are willing to consider a RP that is does not satisify the target
-    // as long as it doesn't spill to memory. In other words, we tolerate SGPR
-    // spills to VGPR since these have a lower impact on the performance.
+    // We are willing to consider a RP that does not satisfy the target
+    // as long as it doesn't result in spilling to memory. In other words, we
+    // tolerate SGPR spills to VGPR since these have a lower impact on the
+    // performance.
     SpillsToMemory |= Target.spillsToMemory();
   }
 
