@@ -495,17 +495,34 @@ bool ClauseProcessor::processSizes(StatementContext &stmtCtx,
 bool ClauseProcessor::processNumTeams(
     lower::StatementContext &stmtCtx,
     mlir::omp::NumTeamsClauseOps &result) const {
-  // TODO Get lower and upper bounds for num_teams when parser is updated to
-  // accept both.
   if (auto *clause = findUniqueClause<omp::clause::NumTeams>()) {
-    // The num_teams directive accepts a list of team lower/upper bounds.
-    // This is an extension to support grid specification for ompx_bare.
-    // Here, only expect a single element in the list.
-    assert(clause->v.size() == 1);
-    // auto lowerBound = std::get<std::optional<ExprTy>>(clause->v[0]->t);
-    auto &upperBound = std::get<ExprTy>(clause->v[0].t);
-    result.numTeamsUpper =
-        fir::getBase(converter.genExprValue(upperBound, stmtCtx));
+    // The num_teams clause accepts a list of upper bounds.
+    // With dims modifier: multiple upper bounds for multi-dimensional grid
+    // Without dims modifier: single Range with optional lower/upper bounds
+    assert(!clause->v.empty());
+
+    // Check if dims modifier is present (indicated by having multiple elements
+    // in the list, or single element without lower bound but with multiple
+    // upper bounds from dims modifier parsing)
+    if (clause->v.size() > 1) {
+      // Dims modifier case: multiple upper bounds
+      fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+      result.numTeamsNumDims = firOpBuilder.getI64IntegerAttr(clause->v.size());
+      for (const auto &range : clause->v) {
+        auto &upperBound = std::get<ExprTy>(range.t);
+        result.numTeamsDimsValues.push_back(
+            fir::getBase(converter.genExprValue(upperBound, stmtCtx)));
+      }
+    } else {
+      // Legacy case: single element with optional lower and upper bounds
+      auto &lowerBound = std::get<std::optional<ExprTy>>(clause->v[0].t);
+      auto &upperBound = std::get<ExprTy>(clause->v[0].t);
+      if (lowerBound)
+        result.numTeamsLower =
+            fir::getBase(converter.genExprValue(*lowerBound, stmtCtx));
+      result.numTeamsUpper =
+          fir::getBase(converter.genExprValue(upperBound, stmtCtx));
+    }
     return true;
   }
   return false;
