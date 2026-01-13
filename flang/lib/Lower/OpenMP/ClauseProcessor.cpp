@@ -515,9 +515,23 @@ bool ClauseProcessor::processNumThreads(
     lower::StatementContext &stmtCtx,
     mlir::omp::NumThreadsClauseOps &result) const {
   if (auto *clause = findUniqueClause<omp::clause::NumThreads>()) {
-    // OMPIRBuilder expects `NUM_THREADS` clause as a `Value`.
-    result.numThreadsDimsValues.push_back(
-        fir::getBase(converter.genExprValue(clause->v, stmtCtx)));
+    // The num_threads clause accepts a list of values.
+    // With dims modifier (OpenMP 6.1): multiple values for multi-dimensional
+    // Without dims modifier: single value
+    assert(!clause->v.empty());
+
+    // If multiple values, this indicates dims modifier is present
+    if (clause->v.size() > 1) {
+      fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+      result.numThreadsNumDims =
+          firOpBuilder.getI64IntegerAttr(clause->v.size());
+    }
+
+    // Populate all values
+    for (const auto &val : clause->v) {
+      result.numThreadsDimsValues.push_back(
+          fir::getBase(converter.genExprValue(val, stmtCtx)));
+    }
     return true;
   }
   return false;
