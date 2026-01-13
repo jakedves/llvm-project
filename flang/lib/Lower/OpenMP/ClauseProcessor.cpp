@@ -668,9 +668,23 @@ bool ClauseProcessor::processThreadLimit(
     lower::StatementContext &stmtCtx,
     mlir::omp::ThreadLimitClauseOps &result) const {
   if (auto *clause = findUniqueClause<omp::clause::ThreadLimit>()) {
-    mlir::Value threadLimitVal =
-        fir::getBase(converter.genExprValue(clause->v, stmtCtx));
-    result.threadLimitDimsValues.push_back(threadLimitVal);
+    // The thread_limit clause accepts a list of values.
+    // With dims modifier (OpenMP 6.1): multiple values for multi-dimensional
+    // Without dims modifier: single value
+    assert(!clause->v.empty());
+
+    // If multiple values, this indicates dims modifier is present
+    if (clause->v.size() > 1) {
+      fir::FirOpBuilder &firOpBuilder = converter.getFirOpBuilder();
+      result.threadLimitNumDims =
+          firOpBuilder.getI64IntegerAttr(clause->v.size());
+    }
+
+    // Populate all values
+    for (const auto &val : clause->v) {
+      result.threadLimitDimsValues.push_back(
+          fir::getBase(converter.genExprValue(val, stmtCtx)));
+    }
     return true;
   }
   return false;
