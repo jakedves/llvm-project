@@ -7,10 +7,7 @@ The `llvm-bolt-binary-analysis` tool enables running requested binary analyses
 on binaries, and generating reports. It does this by building on top of the
 analyses implemented in the BOLT libraries.
 
-## Which binary analyses are implemented?
-
-* [Security scanners](#security-scanners)
-  * [pac-ret analysis](#pac-ret-analysis)
+## Background and motivation
 
 ### Security scanners
 
@@ -61,100 +58,353 @@ The security scanners implemented in `llvm-bolt-binary-analysis` aim to enable
 the testing of security hardening in arbitrary programs and not just specific
 examples.
 
+### Pointer Authentication
 
-#### pac-ret analysis
+[Pointer Authentication](https://clang.llvm.org/docs/PointerAuthentication.html)
+is intended to make it harder for an attacker to replace pointers at run time.
+This is achieved by making it possible for the compiler or the programmer to
+produce a *signed* pointer from a raw one, and then to probabilistically
+*authenticate the signature* at another site in the program.
+On AArch64 this is achieved by injecting a cryptographic hash, called a
+["Pointer Authentication Code" (PAC)](https://llsoftsec.github.io/llsoftsecbook/#pointer-authentication),
+to the upper bits of the pointer.
+While this approach can be applied to any pointers in the program, the most
+frequent use case, at least in C and C++, is protecting the code pointers.
+The language rules for such pointers are more restrictive, thus allowing the
+compiler to implement various hardenings transparently to the programmer.
 
-`pac-ret` protection is a security hardening scheme implemented in compilers
-such as GCC and Clang, using the command line option
-`-mbranch-protection=pac-ret`. This option is enabled by default on most widely
-used Linux distributions.
-
+Probably the most simple variant of hardening based on Pointer Authentication is
+`pac-ret`, a security hardening scheme implemented in compilers such as GCC and
+Clang, using the command line option `-mbranch-protection=pac-ret`. This option
+is enabled by default on most widely used Linux distributions.
 The hardening scheme mitigates
 [Return-Oriented Programming (ROP)](https://llsoftsec.github.io/llsoftsecbook/#return-oriented-programming)
-attacks by making sure that return addresses are only ever stored to memory with
-a cryptographic hash, called a
-["Pointer Authentication Code" (PAC)](https://llsoftsec.github.io/llsoftsecbook/#pointer-authentication),
-in the upper bits of the pointer. This makes it substantially harder for
-attackers to divert control flow by overwriting a return address with a
-different value.
+attacks by making sure that return addresses are only ever stored to memory
+protected by pointer signing. This makes it substantially harder for attackers
+to divert control flow by overwriting a return address with a different value.
 
-The hardening scheme relies on compilers producing appropriate code sequences when
-processing return addresses, especially when these are stored to and retrieved
-from memory.
+## Pointer Authentication validator
 
-The `pac-ret` binary analysis can be invoked using the command line option
-`--scanners=pac-ret`. It makes `llvm-bolt-binary-analysis` scan through the
-provided binary, checking each function for the following security property:
+Pointer Authentication analysis is able to search for a number of gadget kinds,
+with the specific set depending on command line options:
+* non-protected return instructions
+* non-protected branch or call instructions
+* signing of untrusted values (signing oracles)
+* ... and a few other kinds
 
-> For each procedure and exception return instruction, the destination register
-> must have one of the following properties:
->
-> 1. be immutable within the function, or
-> 2. the last write to the register must be by an authenticating instruction. This
->    includes combined authentication and return instructions such as `RETAA`.
+Validation is performed by `llvm-bolt-binary-analysis` on a per-function basis.
+First, the register properties are computed by analyzing the function as a whole.
+Then, the instructions are considered in isolation. For each kind of gadget,
+the set of susceptible instructions is computed. The properties of input or
+output registers of each such instruction are analyzed and reports are produced
+for unsafe instruction usage.
 
-##### Example 1
+Each gadget kind that is searched for can be characterized by
+* the set of instructions to analyze
+* the properties of input or output operands to check
 
-For example, a typical non-pac-ret-protected function looks as follows:
+Currently, three properties can be computed for each register at any given
+program point:
+* **"trusted"** - the register is known not to be attacker-controlled, either because
+  it successfully passed authentication or because its value was materialized
+  using an instruction sequence that an attacker cannot tamper with
+  * **"safe-to-dereference"** (sometimes referred to as "s-t-d" below) - a weaker property is that the register can be
+    controlled by an attacker to some extent, but any memory access using a value
+    crafted by an attacker is known to result in access to an unmapped memory
+    ("segmentation fault"). This allows implementing failed authentication
+    as returning a known-broken memory address, but requires extra care to be
+    taken when implementing operations like re-signing a pointer with a different
+    signing schema. If any failed authentication is guaranteed to terminate the
+    program abnormally, then "safe-to-dereference" and "trusted" properties
+    are equivalent.
+* **"cannot escape unchecked"** - at every possible execution path after this point,
+  it is known to be impossible for an attacker to determine that the value is
+  a result of a failed authentication operation (for example, the register is
+  zeroed, or its value is checked to be valid, so that failure results in
+  immediate abnormal program termination).
+
+### Return address protection (before return instruction)
+
+**Instructions:** Return instructions without built-in authentication:
+either `ret` (implicit `x30` register) or `ret <reg>`, but not `retaa` and
+similar instructions.
+
+**Property:** The register holding the return address must be safe-to-dereference.
+
+**Notes:** Cross-exception-level return instructions are not analyzed yet.
+
+A report is generated for a return instruction whose destination is possibly
+attacker-controlled.
+
+**Examples:**
+```
+authenticated_return:
+  pacibsp
+  ; ...
+  ; ... some code here ...
+  ; ...
+  retab ; Built-in authentication, thus out of scope.
+
+good_leaf_function:
+  ; x30 is implicitly safe-to-dereference (s-t-d) and trusted at function entry.
+  mov     x0, #42
+  ; x30 was not written by this function, thus remains s-t-d.
+  ret
+
+good_non_leaf_function:
+  pacibsp
+
+  ; Spilling signed return address.
+  stp     x29, x30, [sp, #-16]!
+  mov     x29, sp
+
+  bl      @callee
+
+  ; Re-loading signed return address.
+  ; LDP writes to x30 and thus resets it to neither s-t-d nor trusted state.
+  ldp     x29, x30, [sp], #16
+
+  ; Checking that signature is valid.
+  ; AUTIBSP sets "s-t-d" property of x30, but not "trusted" (unless FEAT_FPAC
+  ; is known to be implemented).
+  autibsp
+
+  ; x30 is s-t-d at this point.
+  ret
+
+bad_spill:
+  ; x30 is implicitly s-t-d at function entry.
+  stp     x29, x30, [sp, #-16]!
+  mov     x29, sp
+
+  bl      @callee ; Spilled x30 may have been overwritten on stack.
+
+  ; Writing to x30 resets its s-t-d property.
+  ldp     x29, x30, [sp], #16
+  ; x30 is unsafe by the time it is used by ret, thus generating a report.
+  ret
+
+bad_clobber:
+  pacibsp
+  ; ...
+  ; ... some code here ...
+  ; ...
+  autibsp
+  mov     x30, x1
+  ; The value in LR is unsafe, even though there was autibsp above.
+  ret
+```
+
+### Return address protection before tail call
+
+**Instructions:** Branch instructions (both direct and indirect, regular or
+with built-in authentication), identified as tail calls either by BOLT or by
+PtrAuth gadget scanner's heuristic.
+
+**Property:** `x30` must be trusted.
+
+**Notes:** Heuristics are involved to classify instructions either as a tail
+call or as another kind of branch (such as jump table or computed goto).
+
+A gadget kind related to unprotected return is tail call performed with an
+untrusted address in `x30` like this:
 
 ```
-        stp     x29, x30, [sp, #-0x10]!
-        mov     x29, sp
-        bl      g@PLT
-        add     x0, x0, #0x3
-        ldp     x29, x30, [sp], #0x10
-        ret
+untrusted_tail_call:
+  stp     x29, x30, [sp, #-16]!
+  mov     x29, sp
+  bl      @callee
+  ldp     x29, x30, [sp], #16
+  ; x30 is neither trusted nor safe-to-dereference at this point.
+  b       @tail_callee
+
+tail_callee:
+  pacibsp
+  ; ...
 ```
 
-The return instruction `ret` implicitly uses register `x30` as the address to
-return to. Register `x30` was last written by instruction `ldp`, which is not an
-authenticating instruction. `llvm-bolt-binary-analysis --scanners=pac-ret` will
-report this as follows:
+While `b tail_callee` instruction itself does not use the value stored in `x30`,
+calling a function with untrusted address in `x30` violates the assumption that
+return address is trusted at least at the function entry.
+
+Even though `x30` is likely to be safe-to-dereference before exit from a function
+(whether via return or tail call) in a consistently pac-ret-protected program,
+with respect to this gadget kind it further must be fully "trusted".
+With `x30` being safe-to-dereference, but not fully trusted at the entry to the
+tail callee, the subsequent `pacibsp` instruction may act as a [signing oracle](#signing-oracles).
+Properly mitigating this issue would usually require inserting an explicit
+check after a regular authentication instruction, which may be either too
+expensive (if a fully-generic XPAC-based sequence is being used) on one hand,
+or not required at all (if `FEAT_FPAC` is known to be implemented) on the other hand.
+
+### Indirect branch / call target protection
+
+**Instructions:** Indirect call and branch instructions without built-in
+authentication: either `blr <reg>` or `br <reg>`, but not `blraa`, `braa`
+and similar instructions.
+
+**Property:** Call or branch target register must be safe-to-dereference.
+
+Report is generated for an indirect branch or call instruction whose destination
+is possibly attacker-controlled.
+
+**Examples:**
 
 ```
-GS-PACRET: non-protected ret found in function f1, basic block .LBB00, at address 10310
-  The return instruction is     00010310:       ret # pacret-gadget: pac-ret-gadget<Ret:MCInstBBRef<BB:.LBB00:6>, Overwriting:[MCInstBBRef<BB:.LBB00:5> ]>
-  The 1 instructions that write to the return register after any authentication are:
-  1.     0001030c:      ldp     x29, x30, [sp], #0x10
+direct_call:
+  ; ...
+  bl     @callee ; Direct call, thus out of scope.
+  ; ...
+
+authenticated_call:
+  ; ...
+  ldr     x2, [x1]
+  blraa   x2, x1   ; Built-in authentication, thus out of scope.
+  ; ...
+
+good_call:
+  ; ...
+  ldr     x2, [x1]
+  autia   x2, x1
+  blr     x2
+  ; ...
+
+bad_call:
+  ; ...
+  ldr     x2, [x1]
+  autia   x2, x1
+  ; Store unprotected address.
+  stp     x2, [x3]
+  ; ...
+  ; The callee address may have been overwritten in memory.
+  ldr     x2, [x3]
+  blr     x2
+  ; ...
+```
+
+### Signing oracles
+
+**Instructions:** Address-signing instructions.
+
+**Property:** The address being signed must be trusted.
+
+Reports signing of untrusted values, as this could make arbitrary and possibly
+attacker-controlled values indistinguishable from perfectly trusted and protected ones.
+
+**Examples:**
+
+```
+good_sign_constant:
+  ; ...
+  adrp    x0, @sym
+  add     x0, x0, :lo12:@sym
+  pacda   x0, x1
+  ; ...
+
+good_resign:
+  ; ...
+  autda   x0, x1
+  ; x0 is s-t-d here.
+  ldr     x2, [x0]
+  ; If we got here without crashing on the above LDR, x0 is fully trusted.
+  pacdb   x0, x1
+  ; ...
+
+bad_resign_if_not_fpac:
+  ; ...
+  autda   x0, x1
+  ; x0 is only s-t-d, but not trusted here, unless autda raises an error on failure.
+  pacdb   x0, x1
+  ; ...
+
+very_bad_function:
+  pacda   x0, x1
+  ret
+```
+
+### Authentication oracles
+
+**Instructions:** Standalone authentication instructions: `autda`, `autdb`, etc.
+(i.e. not built-into corresponding memory-accessing instructions, such as
+`ldraa` or `blraa`).
+
+**Property:** The **result** of authentication must be written to a register
+that cannot escape unchecked.
+
+TODO
+
+## Usage
+
+```
+llvm-bolt-binary-analysis --scanners=<list> [options] <binary>
+```
+
+The `--scanners=` option accepts a comma-separated list of analyses to run on
+the provided binary. The binary to be analyzed can be either ELF executable or
+shared object.
+
+In addition to options printed by `llvm-bolt-binary-analysis --help-hidden`,
+other relevant BOLT options can generally be passed, see `llvm-bolt --help-hidden`.
+
+The only analysis which is currently implemented is validation of Pointer
+Authentication hardening applied to the binary.
+The specific set of gadget kinds which are searched for depends on command line
+options. Each gadget found by PtrAuth gadget scanner results in a plain text
+report printed at the end of analysis.
+Furthermore, an attempt is made to provide an extra information on the
+instructions that made the register not safe.
+Please note that this extra information is provided on a best-effort basis and
+is not expected to be as accurate as the reports themselves.
+
+Here is an example of the report:
+
+```
+GS-PAUTH: signing oracle found in function function_name, basic block .LBB08, at address 102b8
+  The instruction is     000102b8:      pacda   x0, x1
+  The 1 instructions that write to the affected registers after any authentication are:
+  1.     000102b4:      ldr     x0, [x1]
   This happens in the following basic block:
-    000102fc:   stp     x29, x30, [sp, #-0x10]!
-    00010300:   mov     x29, sp
-    00010304:   bl      g@PLT
-    00010308:   add     x0, x0, #0x3
-    0001030c:   ldp     x29, x30, [sp], #0x10
-    00010310:   ret # pacret-gadget: pac-ret-gadget<Ret:MCInstBBRef<BB:.LBB00:6>, Overwriting:[MCInstBBRef<BB:.LBB00:5> ]>
+    000102b4:   ldr     x0, [x1]
+    000102b8:   pacda   x0, x1
+    000102bc:   ret
 ```
 
-The exact format of how `llvm-bolt-binary-analysis` reports this is expected to
-evolve over time.
-
-##### Example 2: multiple "last-overwriting" instructions
-
-A simple example that shows how there can be a set of "last overwriting"
-instructions of a register follows:
+A similar report without the associated extra information is along these lines:
 
 ```
-        paciasp
-        stp     x29, x30, [sp, #-0x10]!
-        ldp     x29, x30, [sp], #0x10
-        cbnz    x0, 1f
-        autiasp
-1:
-        ret
+GS-PAUTH: signing oracle found in function function_name, basic block .LBB016, at address 10384
+  The instruction is     00010384:      pacda   x0, x1
+  The 0 instructions that write to the affected registers after any authentication are:
 ```
 
-This will produce the following diagnostic:
+Furthermore, a ", basic block `<name>`" part is omitted in a report, if BOLT was
+unable to reconstruct control-flow graph for the particular function:
 
 ```
-GS-PACRET: non-protected ret found in function f_crossbb1, basic block .Ltmp0, at address 102dc
-  The return instruction is     000102dc:       ret # pacret-gadget: pac-ret-gadget<Ret:MCInstBBRef<BB:.Ltmp0:0>, Overwriting:[MCInstBBRef<BB:.LFT0:0> MCInstBBRef<BB:.LBB00:2> ]>
-  The 2 instructions that write to the return register after any authentication are:
-  1.     000102d0:      ldp     x29, x30, [sp], #0x10
-  2.     000102d8:      autiasp
+GS-PAUTH: signing oracle found in function function_name_nocfg, at address 10510
+  The instruction is     00010510:      pacda   x0, x1
+  The 0 instructions that write to the affected registers after any authentication are:
 ```
 
-(Yes, this diagnostic could be improved because the second "overwriting"
-instruction, `autiasp`, is an authenticating instruction...)
+The analysis is likely to be less precise when CFG information is absent or
+incomplete.
+
+## How to add your own binary analysis
+
+_TODO: this section needs to be written. Ideally, we should have a simple
+"example" or "template" analysis that can be the starting point for implementing
+custom analyses_
+
+
+
+
+
+
+
+
+
+
+
 
 ##### Known false positives or negatives
 
@@ -179,9 +429,3 @@ The following are current known cases of false negatives:
    plan is to implement support for this, picking up the implementation from the
    [prototype branch](
    https://github.com/llvm/llvm-project/compare/main...kbeyls:llvm-project:bolt-gadget-scanner-prototype).
-
-## How to add your own binary analysis
-
-_TODO: this section needs to be written. Ideally, we should have a simple
-"example" or "template" analysis that can be the starting point for implementing
-custom analyses_
