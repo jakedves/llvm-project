@@ -5117,13 +5117,9 @@ void computeKnownFPClass(const Value *V, const APInt &DemandedElts,
       if (II->getArgOperand(0) == II->getArgOperand(1) &&
           isGuaranteedNotToBeUndef(II->getArgOperand(0), Q.AC, Q.CxtI, Q.DT,
                                    Depth + 1)) {
-        KnownFPClass KnownAddend;
+        KnownFPClass KnownSrc, KnownAddend;
         computeKnownFPClass(II->getArgOperand(2), DemandedElts,
                             InterestedClasses, KnownAddend, Q, Depth + 1);
-        if (KnownAddend.isUnknown())
-          return;
-
-        KnownFPClass KnownSrc;
         computeKnownFPClass(II->getArgOperand(0), DemandedElts,
                             InterestedClasses, KnownSrc, Q, Depth + 1);
 
