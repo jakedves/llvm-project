@@ -422,8 +422,11 @@ bool GCNRPTarget::isSaveBeneficial(Register Reg) const {
   if (SRI->isSGPRClass(RC))
     return Excess.SGPR;
 
-  if (SRI->isAGPRClass(RC))
-    return Excess.AGPR;
+  if (SRI->isAGPRClass(RC)) {
+    if (Excess.AGPR)
+      return true;
+    return UnifiedRF && Excess.VGPR;
+  }
 
   return Excess.VGPR || Excess.ArchVGPR;
 }
