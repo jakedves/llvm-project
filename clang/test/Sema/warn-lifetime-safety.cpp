@@ -1405,14 +1405,14 @@ struct S {
 View S::x() const { return i; }
 
 void bar() {
-    View x;
-    {
-        S s;
-        x = s.x(); // expected-warning {{object whose reference is captured does not live long enough}}
-        View y = S().x(); // expected-warning {{object whose reference is captured does not live long enough}} \
-          expected-note {{destroyed here}}
-        (void)y; // expected-note {{later used here}}
-    } // expected-note {{destroyed here}}
-    (void)x; // expected-note {{used here}}
+  View x;
+  {
+      S s;
+      x = s.x();  // expected-warning {{object whose reference is captured does not live long enough}}
+  }               // expected-note {{destroyed here}}
+  (void)x; // expected-note {{used here}}
+  View y = S().x(); // expected-warning {{object whose reference is captured does not live long enough}}
+                    // expected-note@-1 {{destroyed here}}
+  (void)y;          // expected-note {{later used here}}
 }
 }
